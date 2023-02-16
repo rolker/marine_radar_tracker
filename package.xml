@@ -15,6 +15,7 @@
   <depend>grid_map_ros</depend>
   <depend>marine_sensor_msgs</depend>
   <depend>pcl_ros</depend>
+  <depend>project11_msgs</depend>
   <depend>rosbag</depend>
   <depend>roscpp</depend>
   <depend>tf2</depend>

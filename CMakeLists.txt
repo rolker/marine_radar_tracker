@@ -6,6 +6,7 @@ find_package(catkin REQUIRED COMPONENTS
     grid_map_ros
     marine_sensor_msgs
     pcl_ros
+    project11_msgs
     rosbag
     roscpp
     tf2
@@ -19,6 +20,7 @@ catkin_package(
         grid_map_ros
         marine_sensor_msgs
         pcl_ros
+        project11_msgs
         roscpp
         tf2
         tf2_ros

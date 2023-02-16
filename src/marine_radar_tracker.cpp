@@ -3,6 +3,7 @@
 #include <visualization_msgs/MarkerArray.h>
 #include <tf2_ros/transform_listener.h>
 #include <marine_radar_tracker/target.h>
+#include <project11_msgs/Detect.h>
 #include <grid_map_ros/grid_map_ros.hpp>
 #include <tf2/utils.h>
 #include <future>
@@ -25,6 +26,8 @@ public:
     grid_resolution_factor_ = pnh.param("grid_resolution_factor", grid_resolution_factor_);
     grid_length_factor_ = pnh.param("grid_length_factor", grid_length_factor_);
 
+    sensor_id_ = pnh.param("sensor_id", sensor_id_);
+
     double interval = publish_interval_.toSec();
     interval = pnh.param("publish_interval", interval);
     publish_interval_.fromSec(interval);
@@ -33,13 +36,15 @@ public:
 
     markers_publisher_ = nh.advertise<visualization_msgs::MarkerArray>("radar_markers", 10);
     grid_map_publisher_ = nh.advertise<grid_map_msgs::GridMap>("grid_map", 1, true);
+    detects_publisher_ = nh.advertise<project11_msgs::Detect>("detects", 250);
   }
 
 private:
   ros::Subscriber radar_subscriber_;
   ros::Publisher markers_publisher_;
   ros::Publisher grid_map_publisher_;
- 
+  ros::Publisher detects_publisher_;
+
   float detection_threshold_ = 0.0;
   float minimum_range_ = 0.0;
 
@@ -60,6 +65,7 @@ private:
   ros::Time last_publish_time_;
   ros::Duration publish_interval_ = ros::Duration(0.2);
 
+  std::string sensor_id_ = "radar";
 
   void radarSectorCallback(const marine_sensor_msgs::RadarSectorConstPtr &msg)
   {
@@ -235,7 +241,38 @@ private:
     }
 
 
-    //targets_.clear();
+    for(auto b: blobs)
+    {
+      project11_msgs::Detect detect;
+      detect.header.stamp = b->timestamp();
+      detect.header.frame_id = map_frame_;
+      detect.sensor_id = sensor_id_;
+      detect.pose.pose.orientation.w = 1.0;
+
+      auto center = b->centroid();
+
+      detect.pose.pose.position.x = center.x();
+      detect.pose.pose.position.y = center.y();
+
+      // x and y variance
+      double variance = pow(b->effectiveRadius()/2.0,2);
+      detect.pose.covariance[0] = variance;
+      detect.pose.covariance[7] = variance;
+
+      // heading or rotation around z variance
+      // unknown so could be off by 180 degrees
+      detect.pose.covariance[35] = pow(M_PI,2);
+
+      detect.twist.twist.linear.x = std::nan("");
+      detect.twist.twist.linear.y = std::nan("");
+      detect.twist.twist.linear.z = std::nan("");
+      detect.twist.twist.angular.x = std::nan("");
+      detect.twist.twist.angular.y = std::nan("");
+      detect.twist.twist.angular.z = std::nan("");
+
+      detects_publisher_.publish(detect);
+    }
+
     visualization_msgs::MarkerArray blob_markers;
 
     visualization_msgs::Marker marker;

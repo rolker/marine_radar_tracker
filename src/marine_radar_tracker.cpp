@@ -5,6 +5,7 @@
 #include <marine_radar_tracker/target.h>
 #include <grid_map_ros/grid_map_ros.hpp>
 #include <tf2/utils.h>
+#include <future>
 
 namespace marine_radar_tracker
 {
@@ -12,18 +13,21 @@ namespace marine_radar_tracker
 class MarineRadarTracker
 {
 public:
-  MarineRadarTracker():tf_listener_(tf_buffer_),grid_map_({"intensity","latest","latest_age","previous","previous_age","target_id"})
+  MarineRadarTracker():tf_listener_(tf_buffer_),grid_map_({"intensity","latest","latest_age","previous","previous_age"})
   {
     ros::NodeHandle nh, pnh("~");
 
     minimum_range_ = pnh.param("minimum_range", minimum_range_);
     detection_threshold_ = pnh.param("detection_threshold", detection_threshold_);
-    maximum_cumulative_intensity_ = pnh.param("maximum_cumulative_intensity", maximum_cumulative_intensity_);
     map_frame_ = pnh.param("map_frame", map_frame_);
 
     grid_map_.setFrameId(map_frame_);
     grid_resolution_factor_ = pnh.param("grid_resolution_factor", grid_resolution_factor_);
     grid_length_factor_ = pnh.param("grid_length_factor", grid_length_factor_);
+
+    double interval = publish_interval_.toSec();
+    interval = pnh.param("publish_interval", interval);
+    publish_interval_.fromSec(interval);
 
     radar_subscriber_ = nh.subscribe("radar_data", 100, &MarineRadarTracker::radarSectorCallback, this);
 
@@ -38,32 +42,32 @@ private:
  
   float detection_threshold_ = 0.0;
   float minimum_range_ = 0.0;
-  double maximum_cumulative_intensity_ = 0.0;
-
-  uint16_t next_id_ = 0;
-
-  std::list<std::shared_ptr<Target> > targets_;
 
   std::string map_frame_ = "map";
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
 
   grid_map::GridMap grid_map_;
-  float grid_resolution_factor_ = 8.0;
+  float grid_resolution_factor_ = 6.5;
   float grid_length_factor_ = 0.6;
 
   ros::Time last_time_;
   double last_range_ = 0.0;
 
   ros::Time last_target_scan_time_;
+  std::future<bool> scan_done_ = std::future<bool>();
+
+  ros::Time last_publish_time_;
+  ros::Duration publish_interval_ = ros::Duration(0.2);
+
 
   void radarSectorCallback(const marine_sensor_msgs::RadarSectorConstPtr &msg)
   {
     if(ros::Time::isSimTime() && msg->header.stamp < last_time_)
     {
-      targets_.clear();
       grid_map_.clearAll();
       last_target_scan_time_ = ros::Time();
+      last_publish_time_ = ros::Time();
     }
 
     if(msg->range_max != last_range_)
@@ -73,18 +77,6 @@ private:
       grid_map_.setGeometry(grid_map::Length(grid_size, grid_size), resolution);
       last_range_ = msg->range_max;
     }
-
-    double dt = std::max(0.0, (msg->header.stamp - last_time_).toSec());
-
-    for(auto target=targets_.begin(); target != targets_.end(); target++)
-    {
-      if(!(*target)->update(msg->header.stamp))
-        target = targets_.erase(target);
-    }
-
-    // skip messages from older buggy halo driver
-    if(msg->angle_increment > 0)
-      return;
 
     geometry_msgs::TransformStamped transform;
     try{
@@ -106,6 +98,8 @@ private:
 
     grid_map::Position grid_center(radar_in_map_frame.pose.position.x, radar_in_map_frame.pose.position.y);
     grid_map_.move(grid_center);
+
+    double dt = std::max(0.0, (msg->header.stamp - last_time_).toSec());
 
     for(grid_map::GridMapIterator it(grid_map_); !it.isPastEnd(); ++it)
     {
@@ -167,47 +161,64 @@ private:
         if(isnan(grid_map_.at("previous", *it)))
           grid_map_.at("intensity", *it) = grid_map_.at("latest", *it)*.5;
         else
-          grid_map_.at("intensity", *it) = std::min(grid_map_.at("latest", *it), grid_map_.at("previous", *it));
+          grid_map_.at("intensity", *it) = 0.5*(grid_map_.at("latest", *it)+ grid_map_.at("previous", *it)); //std::min(grid_map_.at("latest", *it), grid_map_.at("previous", *it));
     }
 
     grid_map_.setTimestamp(msg->header.stamp.toNSec());
-    grid_map_msgs::GridMap message;
-    grid_map::GridMapRosConverter::toMessage(grid_map_, {"intensity"}, message);
-    grid_map_publisher_.publish(message);
+    if(msg->header.stamp >= last_publish_time_+publish_interval_)
+    {
+      grid_map_msgs::GridMap message;
+      grid_map::GridMapRosConverter::toMessage(grid_map_, {"intensity"}, message);
+      grid_map_publisher_.publish(message);
+      last_publish_time_ = msg->header.stamp;
+    }
 
     last_time_ = msg->header.stamp;
 
     if(last_target_scan_time_.is_zero())
       last_target_scan_time_ = last_time_;
 
-    if((last_time_ - last_target_scan_time_).toSec() < 1.0)
-      return;
+    if((last_time_ - last_target_scan_time_).toSec() > 1.0)
+    {
+      if(!scan_done_.valid() || scan_done_.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready)
+      {
+        ROS_DEBUG_STREAM("Launching scan");
+        scan_done_ = std::async(&MarineRadarTracker::scanForTargets, this, grid_map_);
+        last_target_scan_time_ = last_time_;
+      }
+      else
+        ROS_WARN_STREAM("Not ready to scan");
+    }
+  }
 
-    grid_map_.clear("target_id");
+  bool scanForTargets(grid_map::GridMap grid_map)
+  {
+    grid_map.add("used");
+    ros::Time stamp;
+    stamp.fromNSec(grid_map.getTimestamp());
 
     std::vector<std::shared_ptr<Blob> > blobs;
-    double resolution = grid_map_.getResolution();
+    double resolution = grid_map.getResolution();
 
-    for(grid_map::GridMapIterator it(grid_map_); !it.isPastEnd(); ++it)
+    for(grid_map::GridMapIterator it(grid_map); !it.isPastEnd(); ++it)
     {
-      if(grid_map_.at("intensity", *it) > 0.0 && isnan(grid_map_.at("target_id", *it)))
+      if(grid_map.at("intensity", *it) > 0.0 && isnan(grid_map.at("used", *it)))
       {
         std::list<grid_map::Position> to_check;
         grid_map::Position p;
-        auto blob = std::make_shared<Blob>();
-        blob->stamp.fromNSec(grid_map_.getTimestamp());
-        if(grid_map_.getPosition(*it, p))
+        auto blob = std::make_shared<Blob>(stamp, resolution);
+        if(grid_map.getPosition(*it, p))
           to_check.push_back(p);
         while(!to_check.empty())
         {
           p = to_check.front();
-          if(grid_map_.isInside(p))
-            if(!isnan(grid_map_.atPosition("intensity", p)))
-              if(isnan(grid_map_.atPosition("target_id", p)))
+          if(grid_map.isInside(p))
+            if(!isnan(grid_map.atPosition("intensity", p)))
+              if(isnan(grid_map.atPosition("used", p)))
               {
-                blob->points.push_back(p);
-                grid_map_.atPosition("target_id", p) = 0.0;
-                if(grid_map_.atPosition("intensity", p) > 0.0)
+                blob->add(p, grid_map.atPosition("intensity", p));
+                grid_map.atPosition("used", p) = 0.0;
+                if(grid_map.atPosition("intensity", p) > 0.0)
                 {
                   to_check.push_back(grid_map::Position(p.x()+resolution, p.y()));
                   to_check.push_back(grid_map::Position(p.x()-resolution, p.y()));
@@ -217,64 +228,54 @@ private:
               }
           to_check.pop_front();
         }
-        if(!blob->points.empty() && blob->points.size() < 50)
+        //ROS_INFO_STREAM("blob: c: " << blob->circularity() << " avg i: " << blob->averageIntensity() << " er: " << blob->effectiveRadius());
+        if(!blob->empty())// && blob->effectiveRadius() < 8.0*resolution)
           blobs.push_back(blob);
       }
     }
 
-    last_target_scan_time_ = last_time_;
 
-    targets_.clear();
+    //targets_.clear();
+    visualization_msgs::MarkerArray blob_markers;
+
+    visualization_msgs::Marker marker;
+    marker.header.stamp = stamp;
+    marker.header.frame_id = map_frame_;
+    marker.ns = "radar_blobs";
+    marker.action = visualization_msgs::Marker::DELETEALL;
+    blob_markers.markers.push_back(marker);
 
     for(auto b: blobs)
     {
-      targets_.push_back(std::make_shared<Target>(b));
-      targets_.back()->id = targets_.size();
-    }
-
-    visualization_msgs::MarkerArray markers;
-
-    for (auto target: targets_)
-    {
       visualization_msgs::Marker marker;
-      marker.header.stamp = target->blobs.rbegin()->first;
+      marker.header.stamp = b->timestamp();
       marker.header.frame_id = map_frame_;
 
-      auto age = msg->header.stamp - marker.header.stamp;
-
-      marker.ns = "radar_objects";
-      marker.id = target->id;
-      marker.type = marker.LINE_STRIP;
+      marker.ns = "radar_blobs";
+      marker.id = blob_markers.markers.size();
+      marker.type = marker.SPHERE;
       marker.pose.orientation.w = 1.0;
       marker.color.a = 1.0;
-      marker.lifetime.fromSec(10.0-age.toSec());
+      marker.lifetime.fromSec(1.0);
+      marker.color.r = 1.0;
+      marker.color.b = 0.0;
+      marker.color.g = 0.0;
 
-      auto score = (10.0-age.toSec())/10.0;
+      auto center = b->centroid();
 
-      if(score > 1.0)
-        continue;
+      marker.pose.position.x = center.x();
+      marker.pose.position.y = center.y();
+      marker.pose.position.z = resolution;
 
-      marker.color.r = 0.5-score*0.5;
-      marker.color.b = 0.5-score*0.5;
-      marker.color.g = 0.5+score*0.5;
+      auto radius = b->effectiveRadius();
+      marker.scale.x = radius;
+      marker.scale.y = radius;
+      marker.scale.z = radius;
 
-      marker.scale.x = resolution/10.0;
-
-      geometry_msgs::Point p;
-
-      for(auto bt: target->blobs)
-        if(bt.first > msg->header.stamp - ros::Duration(1.0))
-          for(auto b: bt.second)
-            for(auto bp: b->points)
-            {
-              p.x = bp.x();
-              p.y = bp.y();
-              marker.points.push_back(p);
-            }
-
-      markers.markers.push_back(marker);
+      blob_markers.markers.push_back(marker);
     }
-    markers_publisher_.publish(markers);
+    markers_publisher_.publish(blob_markers);
+    return true;
   }
 };
 

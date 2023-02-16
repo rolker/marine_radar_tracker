@@ -6,6 +6,7 @@ find_package(catkin REQUIRED COMPONENTS
     grid_map_ros
     marine_sensor_msgs
     pcl_ros
+    rosbag
     roscpp
     tf2
     tf2_ros
@@ -34,7 +35,6 @@ target_link_libraries(${PROJECT_NAME} ${catkin_LIBRARIES})
 add_executable(marine_radar_to_pointcloud src/marine_radar_to_pointcloud.cpp)
 add_dependencies(marine_radar_to_pointcloud ${marine_radar_tracker_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(marine_radar_to_pointcloud ${catkin_LIBRARIES})
-
 
 install(TARGETS ${PROJECT_NAME} marine_radar_to_pointcloud
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}

@@ -1,3 +1,5 @@
+This package has moved to https://github.com/rolker/unh_marine_radar
+
 # Convert marine radar data to grid_maps and track targets
 
 Dependencies not yet covered by rosdep:
